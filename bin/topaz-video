@@ -1,0 +1,253 @@
+#!/bin/zsh
+
+set -eu
+
+topaz_root="/Applications/Topaz Video.app/Contents"
+topaz_ffmpeg="$topaz_root/MacOS/ffmpeg"
+topaz_ffprobe="$topaz_root/MacOS/ffprobe"
+model_dir="$topaz_root/Resources/models"
+model_data_dir="$model_dir"
+dry_run=0
+
+usage() {
+  print -r -- "Usage: topaz-video [--dry-run] INPUT_VIDEO [OUTPUT_VIDEO]"
+  print -r -- ""
+  print -r -- "Processes a video headlessly with Topaz FFmpeg:"
+  print -r -- "  Proteus v4 automatic, recover original detail 20"
+  print -r -- "  Chronos v2, 60 FPS, duplicate replacement sensitivity 10"
+  print -r -- "  1080x1920 H.264 MP4; original audio copied when present"
+}
+
+if (( $# > 0 )) && [[ "$1" == "--help" || "$1" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if (( $# > 0 )) && [[ "$1" == "--dry-run" ]]; then
+  dry_run=1
+  shift
+fi
+
+if (( $# < 1 || $# > 2 )); then
+  usage >&2
+  exit 64
+fi
+
+input_path="${1:A}"
+if [[ ! -f "$input_path" ]]; then
+  print -r -- "Input file not found: $input_path" >&2
+  exit 66
+fi
+
+if [[ ! -x "$topaz_ffmpeg" ]]; then
+  print -r -- "Topaz FFmpeg was not found at: $topaz_ffmpeg" >&2
+  exit 69
+fi
+
+if [[ ! -f "$model_dir/auth.tpz" ]]; then
+  print -r -- "Topaz authentication is missing. Open Topaz Video and sign in once." >&2
+  exit 77
+fi
+
+if (( $# == 2 )); then
+  output_path="${2:A}"
+else
+  input_dir="${input_path:h}"
+  input_name="${input_path:t:r}"
+  output_path="$input_dir/${input_name}_topaz_1080x1920_60fps.mp4"
+fi
+
+if [[ "$input_path" == "$output_path" ]]; then
+  print -r -- "Input and output paths must be different." >&2
+  exit 64
+fi
+
+if [[ -e "$output_path" ]]; then
+  print -r -- "Output already exists: $output_path" >&2
+  exit 73
+fi
+
+# Topaz GUI mapping verified from this installation:
+#   Automatic tuning          -> estimate=8
+#   Recover original detail 20 -> blend=0.2
+#   Duplicate sensitivity 10   -> rdt=0.01
+filter_chain='[0:v]tvai_fi=model=chr-2:slowmo=1:rdt=0.01:fps=60:device=0:vram=1:instances=1,tvai_up=model=prob-4:scale=0:w=1080:h=1920:preblur=0:noise=0:details=0:halo=0:blur=0:compression=0:estimate=8:blend=0.2:device=0:vram=1:instances=1,scale=w=1080:h=1920:flags=lanczos:threads=0[v]'
+
+videoai_tag='Framerate changed to 60 using chr-2 replacing duplicate frames. Enhanced using prob-4; mode: auto; revert compression at 0; recover details at 0; sharpen at 0; reduce noise at 0; dehalo at 0; anti-alias/deblur at 0; focus fix Off; and recover original detail at 20. Changed resolution to 1080x1920'
+
+duration_seconds=$("$topaz_ffprobe" -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$input_path")
+input_rate=$("$topaz_ffprobe" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "$input_path")
+input_frames=$("$topaz_ffprobe" -v error -select_streams v:0 -show_entries stream=nb_frames -of default=noprint_wrappers=1:nokey=1 "$input_path")
+total_frames=$(awk -v duration="$duration_seconds" -v rate="$input_rate" -v frames="$input_frames" '
+  function abs(value) { return value < 0 ? -value : value }
+  BEGIN {
+    split(rate, parts, "/")
+    input_fps = parts[2] > 0 ? parts[1] / parts[2] : 0
+    if (frames + 0 > 0 && abs(input_fps - 60) < 0.001) {
+      printf "%d", frames
+    } else if (frames + 0 > 1 && input_fps > 0) {
+      printf "%d", (frames - 1) * 60 / input_fps + 0.5
+    } else {
+      printf "%d", duration * 60 + 0.5
+    }
+  }
+')
+audio_codec=$("$topaz_ffprobe" -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$input_path")
+
+export TVAI_MODEL_DIR="$model_dir"
+export TVAI_MODEL_DATA_DIR="$model_data_dir"
+
+if (( dry_run )); then
+  intermediate_path="${TMPDIR:-/tmp}/topaz-video.GUI-INTERMEDIATE.mp4"
+else
+  mkdir -p "$model_data_dir" "${output_path:h}"
+  work_dir=$(mktemp -d "${TMPDIR:-/tmp}/topaz-video.XXXXXX")
+  intermediate_path="$work_dir/intermediate.mp4"
+
+  cleanup_temporary_files() {
+    rm -f -- "$intermediate_path"
+    rmdir -- "$work_dir" 2>/dev/null || true
+  }
+  trap cleanup_temporary_files EXIT INT TERM
+fi
+
+processing_command=(
+  "$topaz_ffmpeg"
+  -hide_banner
+  -loglevel warning
+  -nostdin
+  -nostats
+  -stats_period 1
+  -progress pipe:1
+  -n
+  -i "$input_path"
+  -sws_flags spline+accurate_rnd+full_chroma_int
+  -filter_complex "$filter_chain"
+  -map '[v]'
+  -c:v h264_videotoolbox
+  -pix_fmt yuv420p
+  -profile:v high
+  -allow_sw 1
+  -g 30
+  -b:v 0
+  -q:v 82
+  -movflags frag_keyframe+empty_moov+delay_moov+use_metadata_tags+write_colr
+  -bf 0
+  -map_metadata 0
+  -map_metadata:s:v 0:s:v
+  -an
+  "$intermediate_path"
+)
+
+finalize_command=(
+  "$topaz_ffmpeg"
+  -hide_banner
+  -loglevel warning
+  -nostdin
+  -n
+  -i "$intermediate_path"
+  -i "$input_path"
+  -strict experimental
+  -c:v copy
+  -map 0:v
+)
+
+if [[ -n "$audio_codec" ]]; then
+  finalize_command+=(
+    -map 1:a:0
+    -map_metadata:s:a:0 1:s:a:0
+    -c:a copy
+  )
+  if [[ "$audio_codec" == "aac" ]]; then
+    finalize_command+=(-bsf:a:0 aac_adtstoasc)
+  fi
+else
+  finalize_command+=(-an)
+fi
+
+finalize_command+=(
+  -metadata "videoai=$videoai_tag"
+  -map_metadata 0
+  -movflags use_metadata_tags
+  -fps_mode passthrough
+  "$output_path"
+)
+
+if (( dry_run )); then
+  print -r -- "AI pass:"
+  print -r -- ${(q)processing_command}
+  print -r -- "Finalization pass:"
+  print -r -- ${(q)finalize_command}
+  exit 0
+fi
+
+print -r -- "Topaz processing started"
+print -r -- "Input:  $input_path"
+print -r -- "Output: $output_path"
+print -r -- "Work:   $total_frames output frames"
+print -r -- "Compute: Apple GPU 0, two parallel model instances"
+print -r -- "Models:  Chronos v2 + Proteus v4 (GUI-matched)"
+print -r -- "Initializing AI models..."
+
+cd "$topaz_root/MacOS"
+set +e
+"${processing_command[@]}" |& awk -v duration="$duration_seconds" -v total_frames="$total_frames" '
+  function clock(seconds, hours, minutes) {
+    if (seconds < 0 || seconds != seconds) return "--:--"
+    seconds = int(seconds + 0.5)
+    hours = int(seconds / 3600)
+    minutes = int((seconds % 3600) / 60)
+    seconds %= 60
+    if (hours > 0) return sprintf("%d:%02d:%02d", hours, minutes, seconds)
+    return sprintf("%02d:%02d", minutes, seconds)
+  }
+  /TopazAuthManager/ { next }
+  /Unable to parse "fps" option value "0"/ { next }
+  /Codec AVOption b:a .* has not been used/ { next }
+  /No accelerated colorspace conversion/ { next }
+  /Color range not set for yuv420p/ { next }
+  /^frame=/       { frame = substr($0, 7); next }
+  /^fps=/         { fps = substr($0, 5); next }
+  /^out_time_us=/ { elapsed = substr($0, 13) / 1000000; next }
+  /^speed=/ {
+    speed = substr($0, 7)
+    sub(/x$/, "", speed)
+    next
+  }
+  /^progress=/ {
+    state = substr($0, 10)
+    percent = total_frames > 0 ? frame * 100 / total_frames : 0
+    if (state == "end") percent = 100
+    if (percent > 100) percent = 100
+    eta = state == "end" ? 0 : ((fps + 0 > 0) ? (total_frames - frame) / (fps + 0) : -1)
+    printf "\r\033[KProgress: %5.1f%% | frame %s | %s fps | %sx | ETA %s", percent, frame, fps, speed, clock(eta)
+    fflush()
+    if (state == "end") print ""
+    next
+  }
+  /^[A-Za-z0-9_]+=/ { next }
+  { print > "/dev/stderr"; fflush("/dev/stderr") }
+'
+processing_status=$pipestatus[1]
+set -e
+
+if (( processing_status != 0 )); then
+  print -r -- "Topaz processing failed with exit code $processing_status." >&2
+  exit "$processing_status"
+fi
+
+print -r -- "Finalizing GUI-matched metadata..."
+set +e
+"${finalize_command[@]}" |& awk '
+  /TopazAuthManager/ { next }
+  { print > "/dev/stderr"; fflush("/dev/stderr") }
+'
+finalize_status=$pipestatus[1]
+set -e
+
+if (( finalize_status != 0 )); then
+  print -r -- "Topaz finalization failed with exit code $finalize_status." >&2
+  exit "$finalize_status"
+fi
+
+print -r -- "Completed: $output_path"

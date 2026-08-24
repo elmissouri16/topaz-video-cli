@@ -1,0 +1,26 @@
+.DS_Store
+.env
+.env.*
+*.log
+
+# Topaz credentials, models, and caches must never be committed.
+auth.tpz
+models/
+coreMLCache/
+*.tz
+*.tz3
+
+# Generated and source media should remain outside the repository.
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.mxf
+*.m4v
+*.wav
+*.aac
+
+# Temporary output.
+.topaz-*
+topaz-video.*
